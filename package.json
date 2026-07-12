@@ -1,0 +1,9 @@
+{
+  "name": "my-pi",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/visual-statusbar.ts"]
+  }
+}
