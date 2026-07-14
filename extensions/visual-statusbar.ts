@@ -4,9 +4,12 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 type LimitUsage = {
 	primary?: number;
 	secondary?: number;
+	primaryResetAt?: number;
+	secondaryResetAt?: number;
 };
 
 const RESET = "\x1b[0m";
+const USAGE_REFRESH_INTERVAL_MS = 60_000;
 const color = (hex: string, text: string) => `\x1b[38;2;${hexToRgb(hex)}m${text}${RESET}`;
 const hexToRgb = (hex: string) => {
 	const value = Number.parseInt(hex.slice(1), 16);
@@ -22,6 +25,7 @@ const pastel = {
 	context: "#a7f3d0",
 	limit: "#fcd34d",
 	empty: "#475569",
+	border: "#64748b",
 	text: "#e2e8f0",
 };
 
@@ -50,6 +54,17 @@ function percentage(value: number | null | undefined): string {
 	return value === null || value === undefined ? "?%" : `${Math.round(Math.max(0, Math.min(100, value)))}%`;
 }
 
+function timeUntilReset(resetAt: number | undefined): string {
+	if (resetAt == null) return "";
+	const now = Date.now() / 1000;
+	const remaining = resetAt - now;
+	if (remaining <= 0) return "resetting…";
+	if (remaining >= 86400) return `${Math.round(remaining / 3600)}h`;
+	if (remaining >= 3600) return `${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m`;
+	if (remaining >= 60) return `${Math.floor(remaining / 60)}m ${Math.floor(remaining % 60)}s`;
+	return `${Math.floor(remaining)}s`;
+}
+
 /** A compact, thin meter with its label physically centered inside the bar. */
 function meter(value: number | null | undefined, width: number, fill: string, suffix = "", label = percentage(value)): string {
 	const normalized = value === null || value === undefined ? 0 : Math.max(0, Math.min(100, value));
@@ -71,6 +86,9 @@ function fit(line: string, width: number): string {
 	return truncateToWidth(line, width, color(pastel.muted, "…"));
 }
 
+function section(content: string): string {
+	return `${color(pastel.border, "⟦")} ${content} ${color(pastel.border, "⟧")}`;
+}
 
 function accountIdFromAccessToken(token: string): string | undefined {
 	try {
@@ -87,9 +105,12 @@ export default function (pi: ExtensionAPI) {
 	let limits: LimitUsage = {};
 	let requestRender: (() => void) | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-	let usagePollAt = 0;
-	let usagePollInFlight = false;
+	let usageRefreshTimer: ReturnType<typeof setInterval> | undefined;
+	const usagePollAt = { codex: 0, deepseek: 0 };
+	const usagePollInFlight = new Set<"codex" | "deepseek">();
 	let deepseekBalance: number | undefined;
+	let deepseekCost = 0;
+	let deepseekCostDirty = true;
 
 	const refresh = () => {
 		if (refreshTimer) return;
@@ -99,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 		}, 80);
 	};
 
-	const maybeFetchBalance = async (provider: string, baseUrl: string, apiKey: string, headers?: Record<string, string>) => {
+	const maybeFetchBalance = async (baseUrl: string, apiKey: string, headers?: Record<string, string>) => {
 		const h = new Headers(headers);
 		h.set("Authorization", `Bearer ${apiKey}`);
 		h.set("Accept", "application/json");
@@ -111,30 +132,27 @@ export default function (pi: ExtensionAPI) {
 		};
 		const raw = payload.balance_infos?.[0]?.total_balance;
 		const value = raw != null ? Number.parseFloat(raw) : NaN;
-		if (Number.isFinite(value)) {
-			if (provider === "deepseek") deepseekBalance = value;
-		}
+		if (Number.isFinite(value)) deepseekBalance = value;
 	};
 
-	const refreshCodexUsage = async (ctx: ExtensionContext) => {
+	const refreshProviderUsage = async (ctx: ExtensionContext) => {
 		const model = ctx.model;
 		const provider = model?.provider;
 
-		// Deepseek: fetch balance on first opportunity and after turns.
-		if (provider === "deepseek" && model?.baseUrl && !usagePollInFlight && Date.now() - usagePollAt >= 60_000) {
-			usagePollInFlight = true;
-			usagePollAt = Date.now();
+		if (provider?.toLowerCase().startsWith("deepseek") && model?.baseUrl && !usagePollInFlight.has("deepseek") && Date.now() - usagePollAt.deepseek >= USAGE_REFRESH_INTERVAL_MS) {
+			usagePollInFlight.add("deepseek");
+			usagePollAt.deepseek = Date.now();
 			try {
 				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-				if (auth.ok && auth.apiKey) await maybeFetchBalance("deepseek", model.baseUrl, auth.apiKey, auth.headers);
+				if (auth.ok && auth.apiKey) await maybeFetchBalance(model.baseUrl, auth.apiKey, auth.headers);
 			} catch { /* offline ok */ }
-			finally { usagePollInFlight = false; }
+			finally { usagePollInFlight.delete("deepseek"); }
 			refresh();
 		}
 
-		if (provider !== "openai-codex" || usagePollInFlight || Date.now() - usagePollAt < 60_000) return;
-		usagePollInFlight = true;
-		usagePollAt = Date.now();
+		if (provider !== "openai-codex" || usagePollInFlight.has("codex") || Date.now() - usagePollAt.codex < USAGE_REFRESH_INTERVAL_MS) return;
+		usagePollInFlight.add("codex");
+		usagePollAt.codex = Date.now();
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok || !auth.apiKey) return;
@@ -150,26 +168,31 @@ export default function (pi: ExtensionAPI) {
 			if (!response.ok) return;
 			const payload = (await response.json()) as {
 				rate_limit?: {
-					primary_window?: { used_percent?: number };
-					secondary_window?: { used_percent?: number };
+					primary_window?: { used_percent?: number; reset_at?: number };
+					secondary_window?: { used_percent?: number; reset_at?: number };
 				};
 			};
-			const primary = payload.rate_limit?.primary_window?.used_percent;
-			const secondary = payload.rate_limit?.secondary_window?.used_percent;
+			const primaryWindow = payload.rate_limit?.primary_window;
+			const secondaryWindow = payload.rate_limit?.secondary_window;
+			const primary = primaryWindow?.used_percent;
+			const secondary = secondaryWindow?.used_percent;
 			limits = {
 				primary: typeof primary === "number" && Number.isFinite(primary) ? primary : limits.primary,
 				secondary: typeof secondary === "number" && Number.isFinite(secondary) ? secondary : limits.secondary,
+				primaryResetAt: (typeof primaryWindow?.reset_at === "number" ? primaryWindow.reset_at : undefined) ?? limits.primaryResetAt,
+				secondaryResetAt: (typeof secondaryWindow?.reset_at === "number" ? secondaryWindow.reset_at : undefined) ?? limits.secondaryResetAt,
 			};
 			refresh();
 		} catch {
 			// Quietly tolerate offline mode and non-subscription credentials.
 		} finally {
-			usagePollInFlight = false;
+			usagePollInFlight.delete("codex");
 		}
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
+		deepseekCostDirty = true;
 
 		ctx.ui.setFooter((tui) => {
 			requestRender = () => tui.requestRender();
@@ -178,6 +201,7 @@ export default function (pi: ExtensionAPI) {
 				invalidate() {},
 				dispose() {
 					requestRender = undefined;
+					if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
 				},
 				render(width: number): string[] {
 					const model = ctx.model;
@@ -187,6 +211,7 @@ export default function (pi: ExtensionAPI) {
 					const cwd = ctx.sessionManager.getCwd();
 					const contextPercent = usage?.percent;
 					const contextWindow = usage?.contextWindow ?? model?.contextWindow ?? 0;
+					const compact = width < 100;
 
 					const home = process.env.HOME;
 					const displayCwd = home && (cwd === home || cwd.startsWith(`${home}/`)) ? `~${cwd.slice(home.length)}` : cwd;
@@ -194,38 +219,49 @@ export default function (pi: ExtensionAPI) {
 						color(pastel.provider, `● ${providerLabel(provider)}`),
 						color(pastel.muted, "·"),
 						color(pastel.model, modelLabel(model?.id)),
-						color(pastel.muted, "·"),
-						color(pastel.thinking, pi.getThinkingLevel()),
+						...(compact ? [] : [color(pastel.muted, "·"), color(pastel.thinking, pi.getThinkingLevel())]),
 					].join(" ");
-					const contextSuffix = contextWindow ? ` (${contextWindowLabel(contextWindow)})` : "";
-					const context = `${color(pastel.muted, "ctx:")} ${meter(contextPercent, Math.min(22, Math.max(16, width - 42)), pastel.context, contextSuffix)}`;
+					const contextSuffix = !compact && contextWindow ? ` (${contextWindowLabel(contextWindow)})` : "";
+					const contextMeterWidth = compact ? 7 : Math.min(22, Math.max(16, width - 42));
+					const context = `${color(pastel.muted, "ctx:")} ${meter(contextPercent, contextMeterWidth, pastel.context, contextSuffix)}`;
 					const isDeepseek = provider?.toLowerCase().startsWith("deepseek") ?? false;
-					const status = isCodex
+					const usageStatus = isCodex
 						? (() => {
+							const resetLabel = timeUntilReset(limits.primaryResetAt);
+							const resetFormatted = resetLabel ? color(pastel.muted, `reset:`) + color(pastel.model, resetLabel) : "";
 							const usage = [
 								color(pastel.muted, "5h:"),
-								meter(limits.primary, Math.min(12, Math.max(8, width - 54)), pastel.limit),
+								meter(limits.primary, compact ? 6 : Math.min(12, Math.max(8, width - 54)), pastel.limit),
+								resetFormatted,
 								color(pastel.muted, "week:"),
 								color(pastel.provider, percentage(limits.secondary)),
 							].join(" ");
-							return `${usage}   ${context}`;
+							return usage;
 						})()
 						: isDeepseek
 							? (() => {
-								let cost = 0;
-								for (const entry of ctx.sessionManager.getEntries()) {
-									if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-									if (!entry.message.provider.toLowerCase().startsWith("deepseek")) continue;
-									cost += entry.message.usage.cost.total;
+								if (deepseekCostDirty) {
+									let cost = 0;
+									for (const entry of ctx.sessionManager.getEntries()) {
+										if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+										const provider = entry.message.provider;
+										if (!provider || !provider.toLowerCase().startsWith("deepseek")) continue;
+										cost += entry.message.usage?.cost?.total ?? 0;
+									}
+									deepseekCost = cost;
+									deepseekCostDirty = false;
 								}
-																const budgetLabel = (deepseekBalance ?? 0) > 0 ? deepseekBalance!.toFixed(2) : "?";
-								const usage = `${color(pastel.muted, "$$")} ${color(pastel.model, cost.toFixed(2))} ${color(pastel.muted, "|")} ${color(pastel.model, budgetLabel)}`;
-								return `${usage}   ${context}`;
+								const budgetLabel = deepseekBalance != null ? deepseekBalance.toFixed(2) : "?";
+								return `${color(pastel.muted, "$$")} ${color(pastel.model, deepseekCost.toFixed(2))} ${color(pastel.muted, "|")} ${color(pastel.model, budgetLabel)}`;
 							})()
-							: context;
+							: color(pastel.muted, "—");
 
-					// Two columns on one line: cwd left; model and live meters grouped on the right.
-					const rightColumn = `${identity}   ${status}`;
+					// Keep independent footer signals visually distinct without adding another row.
+					const rightColumn = [
+						section(identity),
+						section(usageStatus),
+						section(context),
+					].join(" ");
 					const directoryText = truncateToWidth(
 						color(pastel.muted, displayCwd),
 						Math.max(0, width - visibleWidth(rightColumn) - 2),
@@ -242,8 +278,13 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		});
-		void refreshCodexUsage(ctx);
-		refresh();
+		const updateUsage = () => {
+			void refreshProviderUsage(ctx);
+			refresh();
+		};
+		updateUsage();
+		if (usageRefreshTimer) clearInterval(usageRefreshTimer);
+		usageRefreshTimer = setInterval(updateUsage, USAGE_REFRESH_INTERVAL_MS);
 	});
 
 	pi.on("after_provider_response", (event, ctx) => {
@@ -259,28 +300,35 @@ export default function (pi: ExtensionAPI) {
 			/^x-codex(?:-[a-z0-9]+)*-primary-used-percent$/.test(name),
 		);
 		const prefix = primaryHeader?.replace(/-primary-used-percent$/, "");
+		const primaryResetHeader = prefix ? Object.keys(headers).find((name) =>
+			name === `${prefix}-reset-at`,
+		) : undefined;
 		limits = {
 			primary: (primaryHeader ? parse(primaryHeader) : undefined) ?? limits.primary,
 			secondary: (prefix ? parse(`${prefix}-secondary-used-percent`) : undefined) ?? limits.secondary,
+			primaryResetAt: (primaryResetHeader ? parse(primaryResetHeader) : undefined) ?? limits.primaryResetAt,
+			secondaryResetAt: (prefix ? parse(`${prefix}-secondary-reset-at`) : undefined) ?? limits.secondaryResetAt,
 		};
-		void refreshCodexUsage(ctx);
+		void refreshProviderUsage(ctx);
 		refresh();
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		void refreshCodexUsage(ctx);
+		void refreshProviderUsage(ctx);
 		refresh();
 	});
-	pi.on("message_update", refresh);
-	pi.on("message_end", refresh);
+	pi.on("message_update", () => { deepseekCostDirty = true; refresh(); });
+	pi.on("message_end", () => { deepseekCostDirty = true; refresh(); });
 	pi.on("model_select", (_event, ctx) => {
-		void refreshCodexUsage(ctx);
+		void refreshProviderUsage(ctx);
 		refresh();
 	});
 	pi.on("thinking_level_select", refresh);
 	pi.on("session_shutdown", () => {
 		if (refreshTimer) clearTimeout(refreshTimer);
+		if (usageRefreshTimer) clearInterval(usageRefreshTimer);
 		refreshTimer = undefined;
+		usageRefreshTimer = undefined;
 		requestRender = undefined;
 	});
 }

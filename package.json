@@ -4,6 +4,10 @@
   "private": true,
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./extensions/visual-statusbar.ts"]
+    "extensions": [
+      "./extensions/visual-statusbar.ts",
+      "./extensions/ask-questions.ts",
+      "./extensions/kanban-board/index.ts"
+    ]
   }
 }
