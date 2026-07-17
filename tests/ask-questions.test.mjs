@@ -9,6 +9,9 @@ const theme = {
 	fg: (_color, text) => text,
 	bg: (_color, text) => text,
 	bold: (text) => text,
+	italic: (text) => text,
+	strikethrough: (text) => text,
+	underline: (text) => text,
 };
 
 function createHarness(rows = 12) {
@@ -52,6 +55,35 @@ function createHarness(rows = 12) {
 		workingVisibility,
 	};
 }
+
+test("renders markdown in the question body", async () => {
+	const harness = createHarness(30);
+	const execution = harness.tool.execute(
+		"call-markdown",
+		{
+			questions: [{
+				id: "plan",
+				label: "Run plan",
+				prompt: "## Configuration\n\n| Role | Model |\n| --- | --- |\n| Worker | `openai/gpt-5` |\n\n- **Verify:** `npm test`",
+				options: [{ value: "approve", label: "Approve" }],
+			}],
+		},
+		undefined,
+		undefined,
+		harness.ctx,
+	);
+
+	const renderedText = harness.component.render(60).join("\n");
+	assert.match(renderedText, /Configuration/);
+	assert.match(renderedText, /┌|\| Role/);
+	assert.match(renderedText, /openai\/gpt-5/);
+	assert.match(renderedText, /Verify:/);
+	assert.doesNotMatch(renderedText, /## Configuration|\*\*Verify:\*\*/);
+
+	harness.component.handleInput("\x1b");
+	const result = await execution;
+	assert.equal(result.details.cancelled, true);
+});
 
 test("renders long questions for native scrolling without an animated refresh loop", async () => {
 	const harness = createHarness(12);

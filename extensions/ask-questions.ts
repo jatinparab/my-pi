@@ -3,6 +3,8 @@ import {
 	Editor,
 	type EditorTheme,
 	Key,
+	Markdown,
+	type MarkdownTheme,
 	matchesKey,
 	Text,
 	visibleWidth,
@@ -48,7 +50,7 @@ const OptionSchema = Type.Object({
 const QuestionSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Stable identifier for this question" })),
 	label: Type.Optional(Type.String({ description: "Short label used in the result, such as Scope or Priority" })),
-	prompt: Type.String({ description: "The question to show the user" }),
+	prompt: Type.String({ description: "Markdown-formatted question body shown to the user" }),
 	options: Type.Array(OptionSchema, { description: "The options the user can choose from" }),
 });
 
@@ -74,10 +76,11 @@ export default function askQuestions(pi: ExtensionAPI) {
 		name: "ask_questions",
 		label: "Ask Questions",
 		description:
-			"Ask the user one or more clarifying questions. Present each question one at a time with selectable options. The tool automatically appends a custom free-text option — do NOT add any 'Other', 'Custom', 'Write', or free-text option in the options array. Use when the user's preference or decision is needed before continuing.",
+			"Ask the user one or more clarifying questions. Question prompts support Markdown and are shown one at a time with selectable options. The tool automatically appends a custom free-text option — do NOT add any 'Other', 'Custom', 'Write', or free-text option in the options array. Use when the user's preference or decision is needed before continuing.",
 		promptSnippet: "Ask the user a sequence of questions with options and custom answers",
 		promptGuidelines: [
 			"Use ask_questions when you need the user's decision, preference, or clarification before proceeding.",
+			"Question prompts support Markdown; put decision context that the user must see in the prompt body.",
 			"Use concise option labels and descriptions; ask related questions together and order them logically.",
 			"The tool automatically adds a custom free-text option. Do NOT add any 'Other', 'Custom', 'Write in', or free-text options in your options array.",
 		],
@@ -115,6 +118,31 @@ export default function askQuestions(pi: ExtensionAPI) {
 				let cachedWidth: number | undefined;
 				let cachedHeight: number | undefined;
 				const answers: Answer[] = [];
+
+				const markdownTheme: MarkdownTheme = {
+					heading: (text) => theme.fg("mdHeading", text),
+					link: (text) => theme.fg("mdLink", text),
+					linkUrl: (text) => theme.fg("mdLinkUrl", text),
+					code: (text) => theme.fg("mdCode", text),
+					codeBlock: (text) => theme.fg("mdCodeBlock", text),
+					codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
+					quote: (text) => theme.fg("mdQuote", text),
+					quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
+					hr: (text) => theme.fg("mdHr", text),
+					listBullet: (text) => theme.fg("mdListBullet", text),
+					bold: (text) => theme.bold(text),
+					italic: (text) => theme.italic(text),
+					strikethrough: (text) => theme.strikethrough(text),
+					underline: (text) => theme.underline(text),
+				};
+				const promptMarkdown = questions.map((question) => new Markdown(
+					question.prompt,
+					1,
+					0,
+					markdownTheme,
+					{ color: (text) => theme.fg("text", text) },
+					{ preserveOrderedListMarkers: true, preserveBackslashEscapes: true },
+				));
 
 				const editorTheme: EditorTheme = {
 					borderColor: (s) => theme.fg("accent", s),
@@ -264,7 +292,7 @@ export default function askQuestions(pi: ExtensionAPI) {
 					lines.push("");
 
 					addWrappedWithPrefix(" ", theme.fg("accent", theme.bold(question.label.toUpperCase())));
-					addWrappedWithPrefix(" ", theme.fg("text", question.prompt));
+					lines.push(...promptMarkdown[questionIndex]!.render(renderWidth));
 					lines.push("");
 
 					for (let index = 0; index < options.length; index++) {
@@ -304,6 +332,7 @@ export default function askQuestions(pi: ExtensionAPI) {
 				return {
 					render,
 					invalidate: () => {
+						for (const markdown of promptMarkdown) markdown.invalidate();
 						cachedLines = undefined;
 						cachedWidth = undefined;
 						cachedHeight = undefined;
