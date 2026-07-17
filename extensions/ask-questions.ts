@@ -105,12 +105,15 @@ export default function askQuestions(pi: ExtensionAPI) {
 				return resultFor("Error: ask_questions requires interactive TUI mode", questions);
 			}
 
+			ctx.ui.setWorkingVisible(false);
 			const result = await ctx.ui.custom<AskQuestionsResult>((tui, theme, _keybindings, done) => {
 				let questionIndex = 0;
 				let optionIndex = 0;
 				let customMode = false;
 				let customError = "";
 				let cachedLines: string[] | undefined;
+				let cachedWidth: number | undefined;
+				let cachedHeight: number | undefined;
 				const answers: Answer[] = [];
 
 				const editorTheme: EditorTheme = {
@@ -127,6 +130,8 @@ export default function askQuestions(pi: ExtensionAPI) {
 
 				const refresh = () => {
 					cachedLines = undefined;
+					cachedWidth = undefined;
+					cachedHeight = undefined;
 					tui.requestRender();
 				};
 
@@ -225,7 +230,8 @@ export default function askQuestions(pi: ExtensionAPI) {
 				};
 
 				const render = (width: number): string[] => {
-					if (cachedLines) return cachedLines;
+					const terminalHeight = tui.terminal.rows;
+					if (cachedLines && cachedWidth === width && cachedHeight === terminalHeight) return cachedLines;
 
 					const lines: string[] = [];
 					const renderWidth = Math.max(1, width);
@@ -290,6 +296,8 @@ export default function askQuestions(pi: ExtensionAPI) {
 					lines.push(theme.fg("accent", "━".repeat(renderWidth)));
 
 					cachedLines = lines;
+					cachedWidth = width;
+					cachedHeight = terminalHeight;
 					return lines;
 				};
 
@@ -297,10 +305,12 @@ export default function askQuestions(pi: ExtensionAPI) {
 					render,
 					invalidate: () => {
 						cachedLines = undefined;
+						cachedWidth = undefined;
+						cachedHeight = undefined;
 					},
 					handleInput,
 				};
-			});
+			}).finally(() => ctx.ui.setWorkingVisible(true));
 
 			if (result.cancelled) {
 				const answered = result.answers.length;
