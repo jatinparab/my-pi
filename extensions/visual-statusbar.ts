@@ -322,16 +322,24 @@ export default function (pi: ExtensionAPI) {
 			/^x-codex(?:-[a-z0-9]+)*-primary-used-percent$/.test(name),
 		);
 		const prefix = primaryHeader?.replace(/-primary-used-percent$/, "");
-		const primaryResetHeader = prefix ? Object.keys(headers).find((name) =>
-			name === `${prefix}-reset-at`,
-		) : undefined;
+		const windowFromHeaders = (kind: "primary" | "secondary") => {
+			if (!prefix) return undefined;
+			const windowMinutes = parse(`${prefix}-${kind}-window-minutes`);
+			return {
+				usedPercent: parse(`${prefix}-${kind}-used-percent`),
+				resetAt: parse(`${prefix}-${kind}-reset-at`),
+				windowSeconds: windowMinutes === undefined ? undefined : windowMinutes * 60,
+			};
+		};
+		const primary = windowFromHeaders("primary");
+		const secondary = windowFromHeaders("secondary");
 		limits = {
-			primary: (primaryHeader ? parse(primaryHeader) : undefined) ?? limits.primary,
-			secondary: (prefix ? parse(`${prefix}-secondary-used-percent`) : undefined) ?? limits.secondary,
-			primaryResetAt: (primaryResetHeader ? parse(primaryResetHeader) : undefined) ?? limits.primaryResetAt,
-			secondaryResetAt: (prefix ? parse(`${prefix}-secondary-reset-at`) : undefined) ?? limits.secondaryResetAt,
-			primaryWindowSeconds: limits.primaryWindowSeconds,
-			secondaryWindowSeconds: limits.secondaryWindowSeconds,
+			primary: primary?.usedPercent ?? limits.primary,
+			secondary: secondary?.usedPercent ?? limits.secondary,
+			primaryResetAt: primary?.resetAt ?? limits.primaryResetAt,
+			secondaryResetAt: secondary?.resetAt ?? limits.secondaryResetAt,
+			primaryWindowSeconds: primary?.windowSeconds ?? limits.primaryWindowSeconds,
+			secondaryWindowSeconds: secondary?.windowSeconds ?? limits.secondaryWindowSeconds,
 		};
 		void refreshProviderUsage(ctx);
 		refresh();
