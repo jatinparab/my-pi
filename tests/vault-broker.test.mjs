@@ -152,8 +152,40 @@ test("setup validation accepts cloud/custom HTTPS only and never normalizes secr
 	assert.equal(security.normalizeEmail(" User@Example.COM "), "user@example.com"); assert.throws(() => security.normalizeEmail("not-an-email"), (e) => e.code === "invalid_email"); assert.throws(() => security.validateMasterPassword("short"), (e) => e.code === "invalid_password");
 });
 test("Bitwarden adapter uses direct children and no secret argv", async () => {
-	const seen = []; const adapter = bitwarden.createBitwardenAdapter({ profilePath: "/private/profile", run: async (args, options) => { seen.push({ args, env: options.env }); return args[0] === "status" ? { code: 0, stdout: JSON.stringify({ status: "locked" }), stderr: "" } : { code: 0, stdout: `export BW_SESSION=\"${"A".repeat(32)}\"`, stderr: "" }; } });
-	assert.equal((await adapter.status()).state, "locked"); const result = await adapter.unlock("PASSWORD_SENTINEL"); assert.equal(result.session, "A".repeat(32)); assert(!seen[1].args.includes("PASSWORD_SENTINEL")); assert(!seen[1].args.includes(result.session)); assert.equal(seen[1].env.BW_PASSWORD, "PASSWORD_SENTINEL"); assert.equal(seen[1].env.BW_SESSION, undefined); assert.equal(seen[1].env.BITWARDENCLI_APPDATA_DIR, "/private/profile");
+	const seen = []; const adapter = bitwarden.createBitwardenAdapter({ profilePath: "/private/profile", run: async (args, options) => {
+		seen.push({ args, env: options.env });
+		if (args[0] === "status") return { code: 0, stdout: JSON.stringify({ status: "locked" }), stderr: "" };
+		if (args[0] === "sync") return { code: 1, stdout: "", stderr: "invalid_grant" };
+		return { code: 0, stdout: `export BW_SESSION=\"${"A".repeat(32)}\"`, stderr: "" };
+	} });
+	assert.equal((await adapter.status()).state, "locked");
+	const result = await adapter.unlock("PASSWORD_SENTINEL");
+	assert.equal(result.session, "A".repeat(32)); assert(!seen[1].args.includes("PASSWORD_SENTINEL")); assert(!seen[1].args.includes(result.session)); assert.equal(seen[1].env.BW_PASSWORD, "PASSWORD_SENTINEL"); assert.equal(seen[1].env.BW_SESSION, undefined); assert.equal(seen[1].env.BITWARDENCLI_APPDATA_DIR, "/private/profile");
+	const synced = await adapter.sync({ session: result.session });
+	assert.equal(synced.reauthenticationRequired, true); assert.deepEqual(seen[2].args, ["sync", "--nointeraction"]); assert.equal(seen[2].env.BW_SESSION, result.session); assert(!seen[2].args.includes(result.session));
+});
+
+test("fresh search syncs and privately reauthenticates an invalid-grant broker profile", async () => {
+	let state = "unauthenticated"; let loginCount = 0; let syncCount = 0; const calls = [];
+	const adapter = {
+		async status() { calls.push(["status", state]); return { code: 0, state, userEmail: "user@example.com", serverUrl: "https://vault.example.test" }; },
+		async configure() { return { code: 0 }; },
+		async login() { loginCount++; state = "unlocked"; calls.push(["login", loginCount]); return { code: 0, session: `SESSION_${String(loginCount).padEnd(24, "A")}` }; },
+		async unlock() { state = "unlocked"; return { code: 0, session: "SESSION_UNLOCKED_AAAAAAAAAAAAAAAA" }; },
+		async lock() { state = "locked"; return { code: 0 }; },
+		async logout() { calls.push(["logout"]); state = "unauthenticated"; return { code: 0 }; },
+		async sync() { syncCount++; calls.push(["sync", syncCount]); return syncCount === 1 ? { code: 1, failure: "invalid_credentials", reauthenticationRequired: true } : { code: 0 }; },
+		async listItems() { return { code: 0, items: [{ id: "item-id", type: 2, name: "ESP32 Admin Interface Password", secureNote: { type: 0 }, notes: "private" }] }; },
+		async listFolders() { return { code: 0, folders: [] }; },
+	};
+	const keychain = fakeKeychain("correct-password");
+	const { directory, socketPath, broker } = await createFakeBroker({ adapter, keychain });
+	try {
+		await requestSetup(socketPath, { server: "https://vault.example.test", email: "user@example.com", masterPassword: "correct-password" });
+		const result = await requestVaultItems(socketPath, { action: "search", query: "ESP32 Admin Interface Password" });
+		assert.equal(result.items[0]?.title, "ESP32 Admin Interface Password");
+		assert.equal(syncCount, 2); assert.equal(loginCount, 2); assert.equal(calls.filter(([name]) => name === "logout").length, 1); assert.equal(keychain.calls.some(([name]) => name === "delete"), false);
+	} finally { await broker.stop(); await rm(directory, { recursive: true, force: true }); }
 });
 test("first setup returns only normalized host and retains credential in fake Keychain", async () => {
 	const sentinel = "PASSWORD_SENTINEL_123"; const adapter = fakeVaultAdapter({ initialState: "unauthenticated", loginPassword: sentinel }); const keychain = fakeKeychain(); const { directory, socketPath, broker } = await createFakeBroker({ adapter, keychain });

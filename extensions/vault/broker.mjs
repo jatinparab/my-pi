@@ -295,6 +295,45 @@ export function createBrokerServer({
 		return result.state;
 	};
 
+	const reauthenticateAfterSyncFailure = async () => {
+		if (typeof cli.status !== "function" || typeof cli.logout !== "function" || typeof cli.login !== "function") throw new BrokerError("cli_unavailable");
+		const current = session;
+		let before = await cli.status({ session: current });
+		if (before?.failure || before?.code !== 0 || !before?.state) before = await cli.status({});
+		throwFailure(before, "status");
+		const userEmail = before.userEmail;
+
+		// Drop every lease before replacing authentication. The stale session and
+		// CLI diagnostics remain private even if logout cannot contact the server.
+		sessionCleared = true;
+		clearSession();
+		try { await cli.logout(current); } catch { /* Status below is authoritative. */ }
+		let loggedOut = await cli.status({});
+		if (loggedOut?.state !== "unauthenticated") {
+			try { await cli.logout(undefined); } catch { /* Retry local cleanup once. */ }
+			loggedOut = await cli.status({});
+		}
+		throwFailure(loggedOut, "status");
+		if (loggedOut.state !== "unauthenticated") throw new BrokerError("cli_state");
+		if (!(await useStoredCredential({ ...loggedOut, userEmail: userEmail ?? loggedOut.userEmail }))) throw new BrokerError("cli_state");
+	};
+
+	const syncVault = async () => {
+		if (typeof cli.sync !== "function") return;
+		let synced = await cli.sync({ session });
+		if (synced?.code !== 0 || synced?.failure) {
+			// A transient server/network failure must not make the already-synced
+			// local vault unusable. Authentication failures still recover or fail.
+			if (synced?.failure === "network_error") return;
+			if (!synced?.reauthenticationRequired) throwFailure(synced, "sync");
+			await reauthenticateAfterSyncFailure();
+			synced = await cli.sync({ session });
+			throwFailure(synced, "sync");
+		}
+		sessionLastActivity = now();
+		scheduleLease();
+	};
+
 	const inspectItems = async (params) => {
 		let input;
 		try { input = validateItemsInput(params); }
@@ -327,6 +366,9 @@ export function createBrokerServer({
 			start = saved.offset;
 		} else {
 			if (typeof cli.listItems !== "function") throw new BrokerError("cli_unavailable");
+			// A fresh list/search observes server-side changes. Cursor continuations
+			// remain pinned to their original bounded snapshot.
+			await syncVault();
 			const listed = await cli.listItems(input.action === "search" ? { search: input.query, session } : { session });
 			throwFailure(listed, "list_items");
 			if (!Array.isArray(listed.items)) throw new BrokerError("invalid_cli_json");

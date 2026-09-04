@@ -6,6 +6,8 @@ type LimitUsage = {
 	secondary?: number;
 	primaryResetAt?: number;
 	secondaryResetAt?: number;
+	primaryWindowSeconds?: number;
+	secondaryWindowSeconds?: number;
 };
 
 const RESET = "\x1b[0m";
@@ -63,6 +65,15 @@ function timeUntilReset(resetAt: number | undefined): string {
 	if (remaining >= 3600) return `${Math.floor(remaining / 3600)}h ${Math.floor((remaining % 3600) / 60)}m`;
 	if (remaining >= 60) return `${Math.floor(remaining / 60)}m ${Math.floor(remaining % 60)}s`;
 	return `${Math.floor(remaining)}s`;
+}
+
+function limitWindowLabel(seconds: number | undefined, fallback: string): string {
+	if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return fallback;
+	if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+	if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+	if (seconds >= 3600) return `${Math.round(seconds / 3600)}h`;
+	if (seconds % 60 === 0) return `${seconds / 60}m`;
+	return `${seconds}s`;
 }
 
 /** A compact, thin meter with its label physically centered inside the bar. */
@@ -168,19 +179,23 @@ export default function (pi: ExtensionAPI) {
 			if (!response.ok) return;
 			const payload = (await response.json()) as {
 				rate_limit?: {
-					primary_window?: { used_percent?: number; reset_at?: number };
-					secondary_window?: { used_percent?: number; reset_at?: number };
+					primary_window?: { used_percent?: number; reset_at?: number; limit_window_seconds?: number } | null;
+					secondary_window?: { used_percent?: number; reset_at?: number; limit_window_seconds?: number } | null;
 				};
 			};
 			const primaryWindow = payload.rate_limit?.primary_window;
 			const secondaryWindow = payload.rate_limit?.secondary_window;
-			const primary = primaryWindow?.used_percent;
-			const secondary = secondaryWindow?.used_percent;
+			const validNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+			// This endpoint is authoritative. In particular, a null secondary window
+			// means the account no longer has that quota; don't retain stale values
+			// captured from an earlier response header.
 			limits = {
-				primary: typeof primary === "number" && Number.isFinite(primary) ? primary : limits.primary,
-				secondary: typeof secondary === "number" && Number.isFinite(secondary) ? secondary : limits.secondary,
-				primaryResetAt: (typeof primaryWindow?.reset_at === "number" ? primaryWindow.reset_at : undefined) ?? limits.primaryResetAt,
-				secondaryResetAt: (typeof secondaryWindow?.reset_at === "number" ? secondaryWindow.reset_at : undefined) ?? limits.secondaryResetAt,
+				primary: validNumber(primaryWindow?.used_percent),
+				secondary: validNumber(secondaryWindow?.used_percent),
+				primaryResetAt: validNumber(primaryWindow?.reset_at),
+				secondaryResetAt: validNumber(secondaryWindow?.reset_at),
+				primaryWindowSeconds: validNumber(primaryWindow?.limit_window_seconds),
+				secondaryWindowSeconds: validNumber(secondaryWindow?.limit_window_seconds),
 			};
 			refresh();
 		} catch {
@@ -227,16 +242,23 @@ export default function (pi: ExtensionAPI) {
 					const isDeepseek = provider?.toLowerCase().startsWith("deepseek") ?? false;
 					const usageStatus = isCodex
 						? (() => {
-							const resetLabel = timeUntilReset(limits.primaryResetAt);
-							const resetFormatted = resetLabel ? color(pastel.muted, `reset:`) + color(pastel.model, resetLabel) : "";
-							const usage = [
-								color(pastel.muted, "5h:"),
-								meter(limits.primary, compact ? 6 : Math.min(12, Math.max(8, width - 54)), pastel.limit),
-								resetFormatted,
-								color(pastel.muted, "week:"),
-								color(pastel.provider, percentage(limits.secondary)),
-							].join(" ");
-							return usage;
+							const windowUsage = (label: string, value: number | undefined, resetAt: number | undefined) => {
+								const resetLabel = timeUntilReset(resetAt);
+								const reset = resetLabel ? color(pastel.muted, "reset:") + color(pastel.model, resetLabel) : "";
+								return [
+									color(pastel.muted, `${label}:`),
+									meter(value, compact ? 6 : Math.min(12, Math.max(8, width - 54)), pastel.limit),
+									reset,
+								].filter(Boolean).join(" ");
+							};
+							const windows: string[] = [];
+							if (limits.primary != null) {
+								windows.push(windowUsage(limitWindowLabel(limits.primaryWindowSeconds, "primary"), limits.primary, limits.primaryResetAt));
+							}
+							if (limits.secondary != null) {
+								windows.push(windowUsage(limitWindowLabel(limits.secondaryWindowSeconds, "secondary"), limits.secondary, limits.secondaryResetAt));
+							}
+							return windows.length > 0 ? windows.join(" ") : color(pastel.muted, "—");
 						})()
 						: isDeepseek
 							? (() => {
@@ -308,6 +330,8 @@ export default function (pi: ExtensionAPI) {
 			secondary: (prefix ? parse(`${prefix}-secondary-used-percent`) : undefined) ?? limits.secondary,
 			primaryResetAt: (primaryResetHeader ? parse(primaryResetHeader) : undefined) ?? limits.primaryResetAt,
 			secondaryResetAt: (prefix ? parse(`${prefix}-secondary-reset-at`) : undefined) ?? limits.secondaryResetAt,
+			primaryWindowSeconds: limits.primaryWindowSeconds,
+			secondaryWindowSeconds: limits.secondaryWindowSeconds,
 		};
 		void refreshProviderUsage(ctx);
 		refresh();

@@ -86,6 +86,11 @@ function outputOverflow(result) {
 	return Boolean(result?.stdoutOverflowed || result?.stderrOverflowed || result?.stdoutTruncated || result?.stderrTruncated);
 }
 
+function reauthenticationRequired(result) {
+	const text = `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`.toLowerCase();
+	return /invalid[_ -]?grant|not (?:currently )?logged in|session (?:is )?(?:invalid|expired)|token (?:is )?(?:invalid|expired|revoked)/u.test(text);
+}
+
 function sessionFromOutput(output) {
 	for (const line of output.split(/\r?\n/u)) {
 		const match = line.match(/(?:export\s+)?BW_SESSION\s*=\s*["']([^"']+)["']/u) ??
@@ -179,6 +184,14 @@ export function createBitwardenAdapter({ profilePath, executable = "bw", run, sp
 		async logout(session) {
 			const result = await call(["logout", "--nointeraction"], { session });
 			return { ...result, failure: result.code === 0 ? undefined : classifyCliFailure(result) };
+		},
+		async sync({ session } = {}) {
+			const result = await call(["sync", "--nointeraction"], { session });
+			return {
+				...result,
+				failure: result.code === 0 ? undefined : classifyCliFailure(result),
+				reauthenticationRequired: result.code !== 0 && reauthenticationRequired(result),
+			};
 		},
 		async listItems({ search, session } = {}) {
 			// Bitwarden has no pagination for this command in the supported CLI.

@@ -25,7 +25,7 @@ The only model-facing metadata surface. Use:
 { "action": "inspect", "itemHandle": "h_..." }
 ```
 
-List and search return bounded pages of Safe Metadata and an opaque cursor. Inspect returns descriptors and opaque material handles. Handles and cursors are lease-scoped: they expire after lock, forget, reconfiguration, profile replacement, session expiry, broker restart, or eviction. Native Bitwarden search may match hidden values; that membership oracle is accepted under the cooperative-agent model. Search text is never echoed by the extension.
+List and search return bounded pages of Safe Metadata and an opaque cursor. A fresh list or search first attempts to sync the broker's dedicated Bitwarden profile, falling back to its existing local cache only for a transient network/server failure; cursor continuations remain pinned to their original bounded snapshot. If sync reports an expired/revoked login (`invalid_grant`, an invalid session/token, or a logged-out CLI), the broker invalidates existing leases, logs out locally, and re-authenticates once using the Stored Unlock Credential before retrying sync. Inspect returns descriptors and opaque material handles. Handles and cursors are lease-scoped: they expire after lock, forget, re-authentication, reconfiguration, profile replacement, session expiry, broker restart, or eviction. Native Bitwarden search may match hidden values; that membership oracle is accepted under the cooperative-agent model. Search text is never echoed by the extension.
 
 ### `vault_run`
 
@@ -109,7 +109,7 @@ The secure prompt is a masked custom Pi TUI component. A real interactive TUI an
 
 * **`ui_unavailable` / lifecycle refuses to run:** start Pi in its supported TUI mode; do not use print/JSON/RPC for setup, config, or forget.
 * **`keychain_unavailable`:** unlock the macOS login Keychain and verify the installed native keyring package can load. An invalid stored credential is deleted; transient/network errors retain it for recovery.
-* **`cli_unavailable` or `cli_error`:** install a compatible `bw`, keep it on `PATH`, and retry. Broker-owned children receive only a minimal environment plus the dedicated profile and private session.
+* **`cli_unavailable` or `cli_error`:** install a compatible `bw`, keep it on `PATH`, and retry. Broker-owned children receive only a minimal environment plus the dedicated profile and private session. Run sync through `vault_items` list/search rather than `vault_run bw sync`: `vault_run` deliberately cannot adopt the broker's private profile or Vault Session.
 * **`invalid_cli_json` / `output_overflow`:** the CLI response was malformed or exceeded the finite private bound; no partial response is used. Retry after checking the CLI version and vault size.
 * **`invalid_handle` / `invalid_cursor`:** lock, expiry, reconfiguration, forget, broker restart, or snapshot eviction invalidated it; list/search again.
 * **`host_key_changed` / `host_key_unavailable`:** the remote host key changed, or private trust state is malformed, insecure, full, or unwritable. The handshake is rejected before authentication. After verifying host identity out of band, deleting only the broker runtime's `known_hosts.json` resets trust.
